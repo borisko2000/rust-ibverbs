@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use common::{mr, open_test_device, poll_until, test_device};
 use ibverbs::{
-    AccessFlags, AddressHandleAttribute, CompletionQueue, Connected, Context, Error, Grh,
+    AccessFlags, AddressHandleAttribute, CompletionQueue, Connected, Context, Error, Fallback, Grh,
     LinkLayer, MrAdvice, MrAdviseFlags, Payload, PortState, ProtectionDomain, QueuePair,
     QueuePairAttribute, QueuePairAttributeMask, QueuePairBuilder, QueuePairEndpoint,
     QueuePairState, Rc, RecvRequest, RnrTimer, SendOps, TransportType, Uc, Ud, WcFields,
@@ -2616,4 +2616,296 @@ fn address_handle_from_completion_without_grh() {
     let unread = Grh::from_bytes(&[0; Grh::LEN]);
     AddressHandleAttribute::from_wc(&ctx, 1, &wc, Some(&unread))
         .expect("a header given alongside a GRH-less completion is left unread");
+}
+
+/// A reliable-connected self-loopback queue pair that posts through the legacy `ibv_post_send`
+/// (`Fallback::AlwaysLegacyPostSend`), on the same device the other tests use, so the legacy path
+/// is exercised wherever the suite runs and not only on providers that lack the extended one.
+fn legacy_loopback(inline: u32) -> Loopback<Rc> {
+    let ctx = open_test_device();
+    let cq = ctx
+        .create_cq(64)
+        .build()
+        .expect("failed to create completion queue");
+    let pd = ctx
+        .alloc_pd()
+        .expect("failed to allocate protection domain");
+    let access = AccessFlags::PERMISSIVE | AccessFlags::REMOTE_ATOMIC;
+    let qp = connect_self(&pd, &cq, gid_index(&ctx), |builder| {
+        generous::<Rc>(access)(builder);
+        builder
+            .set_max_inline_data(inline)
+            .set_fallback(Fallback::AlwaysLegacyPostSend);
+    });
+    assert!(qp.is_legacy(), "the builder asked for the legacy path");
+    assert!(
+        qp.as_raw_ex().is_null(),
+        "a legacy queue pair has no extended view"
+    );
+    Loopback { qp, cq, pd }
+}
+
+/// `Fallback::LegacyPostSend` takes the extended path when the provider has it, and falls back
+/// only when it does not: on a device where the default (`Never`) build succeeds, the two builds
+/// land on the same path.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn fallback_legacy_post_send_prefers_extended() {
+    let ctx = open_test_device();
+    let cq = ctx.create_cq(8).build().expect("failed to create CQ");
+    let pd = ctx.alloc_pd().expect("failed to allocate PD");
+    let mut builder = pd
+        .create_qp::<Rc>(&cq, &cq, 1)
+        .expect("failed to create builder");
+    let extended = builder.build();
+    builder.set_fallback(Fallback::LegacyPostSend);
+    let either = builder
+        .build()
+        .expect("failed to build with the fallback allowed");
+    match extended {
+        // The provider has the extended interface (every device the suite runs on today), so
+        // allowing the fallback changes nothing.
+        Ok(extended) => {
+            assert!(!extended.is_legacy());
+            assert!(!extended.into_queue_pair().as_raw_ex().is_null());
+            assert!(!either.is_legacy());
+        }
+        // A provider without it (irdma) refuses the default build and takes the legacy path.
+        Err(Error::Unsupported { .. }) => assert!(either.is_legacy()),
+        Err(e) => panic!("unexpected error {e}"),
+    }
+}
+
+/// Two-sided SEND / RECV and one-sided WRITE and READ through `ibv_post_send`: the same data
+/// moves, and the completions carry the same ids.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn legacy_send_recv_write_read() {
+    let mut lb = legacy_loopback(0);
+
+    let mut recv = mr(&lb.pd, 64);
+    let mut send = mr(&lb.pd, 64);
+    let mut src = mr(&lb.pd, 64);
+    let mut dst = mr(&lb.pd, 64);
+    let mut local = mr(&lb.pd, 64);
+    send.bytes_mut()[..5].copy_from_slice(b"hello");
+    src.bytes_mut()[..6].copy_from_slice(b"verbs!");
+
+    unsafe { lb.qp.post_recv([RecvRequest::new(1, &[recv.slice(..5)])]) }
+        .expect("post_recv failed");
+
+    let write_to = dst.remote().slice(..6);
+    let read_from = dst.remote().slice(..6);
+    let mut batch = lb.qp.start_send();
+    batch.op().signaled().send(2, &[send.slice(..5)]);
+    batch.op().signaled().write(3, &[src.slice(..6)], write_to);
+    batch
+        .op()
+        .signaled()
+        .fenced()
+        .read(4, &[local.slice(..6)], read_from);
+    unsafe { batch.submit() }.expect("legacy submit failed");
+
+    let comps = drain(&lb.cq, 4);
+    for id in [1, 2, 3, 4] {
+        assert!(
+            comps.iter().any(|wc| wc.wr_id() == id),
+            "missing completion {id}"
+        );
+    }
+    assert_eq!(&recv.bytes_mut()[..5], b"hello");
+    assert_eq!(&dst.bytes_mut()[..6], b"verbs!");
+    assert_eq!(&local.bytes_mut()[..6], b"verbs!");
+}
+
+/// Inline payloads through `ibv_post_send`: the bytes are copied when staged, so the caller's
+/// buffers may go away before `submit`, and a write with an immediate consumes a receive.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn legacy_inline_and_imm() {
+    let mut lb = legacy_loopback(64);
+
+    let mut recv = mr(&lb.pd, 64);
+    let mut dst = mr(&lb.pd, 64);
+    let dummy = mr(&lb.pd, 64);
+
+    unsafe {
+        lb.qp.post_recv([
+            RecvRequest::new(1, &[recv.slice(..5)]),
+            RecvRequest::new(2, &[dummy.slice(..1)]),
+        ])
+    }
+    .expect("post_recv failed");
+
+    let remote = dst.remote().slice(..4);
+    let mut batch = lb.qp.start_send();
+    {
+        let message = *b"inrun";
+        let parts = [std::io::IoSlice::new(b"wx"), std::io::IoSlice::new(b"yz")];
+        batch.op().signaled().send(10, Payload::Inline(&message));
+        batch
+            .op()
+            .signaled()
+            .imm(0xdead_beef)
+            .write(11, Payload::InlineList(&parts), remote);
+        // `message` and `parts` end here, before the batch is posted.
+    }
+    unsafe { batch.submit() }.expect("legacy submit failed");
+
+    let comps = drain(&lb.cq, 4);
+    assert_eq!(&recv.bytes_mut()[..5], b"inrun");
+    assert_eq!(&dst.bytes_mut()[..4], b"wxyz");
+    let consumed = comps
+        .iter()
+        .find(|wc| wc.wr_id() == 2)
+        .expect("missing recv completion for write-with-imm");
+    assert_eq!(consumed.imm_data(), Some(0xdead_beef));
+}
+
+/// Atomics through `ibv_post_send`: compare-and-swap and fetch-and-add land, and return the
+/// previous value. Soft-RoCE supports both.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn legacy_atomics() {
+    let mut lb = legacy_loopback(0);
+
+    let mut counter = mr(&lb.pd, 64);
+    let mut old = mr(&lb.pd, 64);
+    counter.bytes_mut()[..8].copy_from_slice(&5u64.to_ne_bytes());
+
+    let remote = counter.remote().slice(..8);
+    let mut batch = lb.qp.start_send();
+    batch
+        .op()
+        .signaled()
+        .atomic_fetch_add(1, old.slice(..8), remote, 10);
+    unsafe { batch.submit() }.expect("legacy fetch-and-add failed");
+    let comps = drain(&lb.cq, 1);
+    assert_eq!(comps[0].wr_id(), 1);
+    assert_eq!(first_u64(old.bytes_mut()), 5);
+    assert_eq!(first_u64(counter.bytes_mut()), 15);
+
+    let mut batch = lb.qp.start_send();
+    batch
+        .op()
+        .signaled()
+        .atomic_cmp_swap(2, old.slice(8..16), remote, 15, 99);
+    unsafe { batch.submit() }.expect("legacy compare-and-swap failed");
+    let comps = drain(&lb.cq, 1);
+    assert_eq!(comps[0].wr_id(), 2);
+    assert_eq!(first_u64(&old.bytes_mut()[8..]), 15);
+    assert_eq!(first_u64(counter.bytes_mut()), 99);
+}
+
+/// Zero-length operations through `ibv_post_send` pass null scatter lists, as the extended path
+/// does, and complete with zero bytes.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn legacy_zero_length_ops() {
+    let mut lb = legacy_loopback(16);
+
+    let remote_mr = lb
+        .pd
+        .allocate(64, AccessFlags::PERMISSIVE)
+        .expect("failed to register remote MR");
+    let remote = remote_mr.remote();
+    let empty_sges: &[ibverbs::LocalMemorySlice] = &[];
+    unsafe {
+        lb.qp.post_recv([
+            RecvRequest::new(1, empty_sges),
+            RecvRequest::new(2, empty_sges),
+        ])
+    }
+    .expect("post_recv failed");
+
+    let mut batch = lb.qp.start_send();
+    batch.op().signaled().write(10, empty_sges, remote);
+    batch.op().signaled().send(11, empty_sges);
+    batch.op().signaled().send(12, Payload::Inline(&[]));
+    unsafe { batch.submit() }.expect("legacy submit with empty payloads failed");
+
+    let comps = drain(&lb.cq, 5);
+    for id in [1, 2] {
+        let wc = comps
+            .iter()
+            .find(|c| c.wr_id() == id)
+            .expect("missing recv completion");
+        assert_eq!(wc.len(), 0);
+    }
+    for id in [10, 11, 12] {
+        assert!(
+            comps.iter().any(|c| c.wr_id() == id),
+            "missing send completion {id}"
+        );
+    }
+}
+
+/// A batch dropped without `submit` posts nothing on the legacy path, and the next batch on the
+/// same queue pair starts empty.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn legacy_dropped_batch_posts_nothing() {
+    let mut lb = legacy_loopback(0);
+    let mut recv = mr(&lb.pd, 64);
+    let mut send = mr(&lb.pd, 64);
+    send.bytes_mut()[..3].copy_from_slice(b"abc");
+
+    unsafe { lb.qp.post_recv([RecvRequest::new(1, &[recv.slice(..3)])]) }
+        .expect("post_recv failed");
+    {
+        let mut abandoned = lb.qp.start_send();
+        abandoned.op().signaled().send(99, &[send.slice(..3)]);
+        // Dropped here.
+    }
+    let mut batch = lb.qp.start_send();
+    batch.op().signaled().send(2, &[send.slice(..3)]);
+    unsafe { batch.submit() }.expect("legacy submit failed");
+
+    let comps = drain(&lb.cq, 2);
+    assert!(
+        comps.iter().all(|wc| wc.wr_id() != 99),
+        "the dropped batch was posted"
+    );
+    assert!(comps.iter().any(|wc| wc.wr_id() == 2));
+    assert_eq!(&recv.bytes_mut()[..3], b"abc");
+}
+
+/// Over-filling the send queue through `ibv_post_send` reports how many requests were posted
+/// before the one that did not fit, so the caller can resubmit the rest.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn legacy_partial_post_reports_posted_count() {
+    let ctx = open_test_device();
+    let cq = ctx.create_cq(64).build().expect("failed to create CQ");
+    let pd = ctx.alloc_pd().expect("failed to allocate PD");
+    // Room for two requests; post four.
+    let mut qp = connect_self::<Rc>(&pd, &cq, gid_index(&ctx), |builder| {
+        builder
+            .set_max_send_wr(2)
+            .set_access(AccessFlags::PERMISSIVE)
+            .set_fallback(Fallback::AlwaysLegacyPostSend);
+    });
+    assert!(qp.is_legacy());
+    let mut dst = mr(&pd, 64);
+    let src = mr(&pd, 64);
+    let remote = dst.remote().slice(..1);
+    let mut batch = qp.start_send();
+    for id in 1..=4 {
+        batch.op().signaled().write(id, &[src.slice(..1)], remote);
+    }
+    match unsafe { batch.submit() } {
+        Err(Error::PostSendBatch { posted, .. }) => {
+            // The provider may have granted a deeper queue than asked; whatever it took is
+            // reported, and at least the two it promised fit.
+            assert!((2..4).contains(&posted), "posted {posted} of 4");
+            let comps = drain(&cq, posted as usize);
+            assert!(comps.iter().all(|wc| wc.wr_id() <= u64::from(posted)));
+        }
+        Ok(()) => {
+            // A provider that rounds the queue up to four or more posts the whole batch.
+            drain(&cq, 4);
+        }
+        Err(e) => panic!("unexpected error {e}"),
+    }
+    let _ = dst.bytes_mut();
 }

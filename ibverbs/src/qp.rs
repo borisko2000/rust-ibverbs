@@ -466,6 +466,368 @@ fn default_send_ops(qp_type: ffi::ibv_qp_type) -> SendOps {
     ops
 }
 
+/// What [`build`](QueuePairBuilder::build) does on a provider without the extended work-request
+/// interface (`ibv_create_qp_ex` with send operations, and the `ibv_wr_*` table) that the send
+/// path posts through by default. Set with [`QueuePairBuilder::set_fallback`].
+///
+/// Two paths exist because providers differ: mlx5, hns, EFA, and rxe install the extended table;
+/// `irdma` has no `ibv_create_qp_ex` at all (`EOPNOTSUPP`), and some providers create the queue
+/// pair but install no table (`ibv_qp_to_qp_ex` returns null). Both paths post the same
+/// operations with the same semantics on the wire; what differs is below the API:
+///
+/// - the extended path hands each operation to the provider as it is built and posts a batch
+///   whole or not at all ([`PostSend`](Error::PostSend) on failure);
+/// - the legacy path stages the batch as `ibv_send_wr`s — copying scatter/gather lists and inline
+///   bytes once — and `ibv_post_send` posts them in order until one fails
+///   ([`PostSendBatch`](Error::PostSendBatch) counts how many it posted). `FLUSH` and
+///   `ATOMIC_WRITE` have no legacy form, so a legacy queue pair refuses a [`SendOps`] that requests
+///   them; neither has an SRD queue pair (`Srd`, behind the `efa` feature, whose RDMA operations
+///   `ibv_send_wr` cannot address), so one is never legacy, whatever its builder's fallback. On a
+///   legacy queue pair [`QueuePair::as_raw_ex`] returns null.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum Fallback {
+    /// Fail with [`Error::Unsupported`] (the default): the queue pair either posts through the
+    /// extended interface or is not created.
+    #[default]
+    Never,
+    /// Post through `ibv_post_send` if the provider lacks the extended interface — when
+    /// `ibv_create_qp_ex` fails with `EOPNOTSUPP` or `EPROTONOSUPPORT`, the queue pair is created
+    /// again with `ibv_create_qp`; when it succeeds without installing the `ibv_wr_*` table, the
+    /// queue pair it made is kept. [`QueuePair::is_legacy`] reports which path was taken.
+    ///
+    /// Only the error, not its cause, selects the fallback: a provider that has the extended
+    /// interface but declines one of the requested [`SendOps`] also answers `EOPNOTSUPP`, and then
+    /// gets a legacy queue pair, on which that operation fails when posted instead.
+    LegacyPostSend,
+    /// Post through `ibv_post_send` unconditionally, on providers that have the extended interface
+    /// too: to exercise the legacy path where both exist, or to get its per-request failure
+    /// reporting.
+    AlwaysLegacyPostSend,
+}
+
+/// How a queue pair's send path reaches the provider, chosen once at creation (see [`Fallback`]).
+enum Posting {
+    /// The extended interface: `wr_start`, the `wr_*` builders, and `wr_complete` on this view of
+    /// the queue pair. `ibv_qp_to_qp_ex` is a cast, so the pointer aliases the `ibv_qp` and lives
+    /// exactly as long.
+    Extended(*mut ffi::ibv_qp_ex),
+    /// The legacy interface: batches are staged here, then handed to `ibv_post_send` whole.
+    ///
+    /// Behind an `UnsafeCell` because a batch is opened through `&QueuePair` (the send half of a
+    /// [`split`](QueuePair::split) queue pair holds a shared reference). What makes the mutable
+    /// borrow sound is the rule every caller already obeys for `wr_start`: whoever opens a batch
+    /// holds the send queue exclusively (`&mut QueuePair` or `&mut SendQueue`), and the receive
+    /// half never touches the send path.
+    Legacy(std::cell::UnsafeCell<LegacyBatch>),
+}
+
+/// The staging area of a legacy send batch: the `ibv_send_wr`s `ibv_post_send` walks, their
+/// scatter/gather entries, and copies of the inline payloads (the extended interface copies those
+/// during the opcode call, so a caller may drop them before `submit`; `ibv_post_send` copies them
+/// only when it runs).
+///
+/// Requests refer to their entries, and inline entries to their bytes, by index until [`link`]
+/// resolves them to pointers right before the post, since the vectors may grow while the batch is
+/// built. The vectors keep their capacity from batch to batch, so a queue pair allocates on the
+/// send path only while its batches are still growing past every earlier one.
+///
+/// [`link`]: LegacyBatch::link
+struct LegacyBatch {
+    wrs: Vec<ffi::ibv_send_wr>,
+    sges: Vec<ffi::ibv_sge>,
+    inline: Vec<u8>,
+    /// One per request, in order.
+    spans: Vec<Span>,
+}
+
+/// Where a staged request's entries are (see [`LegacyBatch`]).
+#[derive(Clone, Copy)]
+struct Span {
+    /// Index in `sges` of the request's first entry; the request's `num_sge` counts them.
+    sge_start: u32,
+    /// The request has one entry, an inline payload whose `addr` is an offset into `inline`.
+    inline: bool,
+}
+
+impl LegacyBatch {
+    /// Room for batches of up to `max_send_wr` requests with `max_send_sge` entries and
+    /// `max_inline_data` inline bytes each, within limits (a deep queue need not reserve megabytes
+    /// up front); larger batches grow the vectors as they are built.
+    fn with_capacity(max_send_wr: u32, max_send_sge: u32, max_inline_data: u32) -> Self {
+        let wrs = (max_send_wr as usize).min(256);
+        LegacyBatch {
+            wrs: Vec::with_capacity(wrs),
+            sges: Vec::with_capacity((wrs * max_send_sge as usize).min(4096)),
+            inline: Vec::with_capacity((wrs * max_inline_data as usize).min(64 << 10)),
+            spans: Vec::with_capacity(wrs),
+        }
+    }
+
+    /// Forgets the staged requests, keeping the capacity.
+    fn clear(&mut self) {
+        self.wrs.clear();
+        self.sges.clear();
+        self.inline.clear();
+        self.spans.clear();
+    }
+
+    /// The number of staged requests.
+    fn len(&self) -> usize {
+        self.wrs.len()
+    }
+
+    /// Stages one request: `op` with `flags` and `wr_id`, addressed to `dest` on a datagram queue
+    /// pair, carrying `payload`. `flags` already carries `IBV_SEND_INLINE` for an inline payload.
+    #[inline]
+    fn push(
+        &mut self,
+        wr_id: u64,
+        flags: u32,
+        op: Op,
+        dest: Option<(*mut ffi::ibv_ah, u32, u32)>,
+        payload: Payload<'_>,
+    ) {
+        let sge_start = self.sges.len();
+        let (num_sge, inline) = match payload {
+            Payload::Sges(local) => {
+                // `LocalMemorySlice` is `repr(transparent)` over `ibv_sge`.
+                let sges = unsafe {
+                    std::slice::from_raw_parts(local.as_ptr().cast::<ffi::ibv_sge>(), local.len())
+                };
+                self.sges.extend_from_slice(sges);
+                (local.len(), false)
+            }
+            Payload::Inline(data) => self.stage_inline([data]),
+            Payload::InlineList(bufs) => self.stage_inline(bufs.iter().map(|b| &**b)),
+        };
+
+        use ffi::ibv_wr_opcode as O;
+        let mut wr = ffi::ibv_send_wr {
+            wr_id,
+            send_flags: flags,
+            num_sge: num_sge as i32,
+            // `next` and `sg_list` are resolved by `link`.
+            ..Default::default()
+        };
+        match op {
+            Op::Send { imm } => {
+                wr.opcode = if imm.is_some() {
+                    O::IBV_WR_SEND_WITH_IMM
+                } else {
+                    O::IBV_WR_SEND
+                };
+            }
+            Op::Write { imm, remote } => {
+                wr.opcode = if imm.is_some() {
+                    O::IBV_WR_RDMA_WRITE_WITH_IMM
+                } else {
+                    O::IBV_WR_RDMA_WRITE
+                };
+                wr.wr.rdma = ffi::ibv_send_wr__bindgen_ty_2__bindgen_ty_1 {
+                    remote_addr: remote.addr,
+                    rkey: remote.rkey,
+                };
+            }
+            Op::Read { remote } => {
+                wr.opcode = O::IBV_WR_RDMA_READ;
+                wr.wr.rdma = ffi::ibv_send_wr__bindgen_ty_2__bindgen_ty_1 {
+                    remote_addr: remote.addr,
+                    rkey: remote.rkey,
+                };
+            }
+            Op::CompareSwap {
+                remote,
+                compare,
+                swap,
+            } => {
+                wr.opcode = O::IBV_WR_ATOMIC_CMP_AND_SWP;
+                wr.wr.atomic = ffi::ibv_send_wr__bindgen_ty_2__bindgen_ty_2 {
+                    remote_addr: remote.addr,
+                    compare_add: compare,
+                    swap,
+                    rkey: remote.rkey,
+                };
+            }
+            Op::FetchAdd { remote, add } => {
+                wr.opcode = O::IBV_WR_ATOMIC_FETCH_AND_ADD;
+                wr.wr.atomic = ffi::ibv_send_wr__bindgen_ty_2__bindgen_ty_2 {
+                    remote_addr: remote.addr,
+                    compare_add: add,
+                    swap: 0,
+                    rkey: remote.rkey,
+                };
+            }
+        }
+        if let Some(imm) = op.imm() {
+            // Network byte order, as `ibv_post_send(3)` documents and `wr_send_imm` expects.
+            wr.__bindgen_anon_1.imm_data = imm.to_be();
+        }
+        // `ud` shares the `wr` union with the `rdma` and `atomic` operands written above, so an
+        // addressed request must be a SEND. That holds because the only datagram transport that
+        // posts anything else, SRD, never takes the legacy path (`no_legacy_form` refuses it).
+        if let Some((ah, remote_qpn, remote_qkey)) = dest {
+            debug_assert!(
+                matches!(op, Op::Send { .. }),
+                "an addressed legacy request must be a SEND: `ud` would overwrite the operands"
+            );
+            wr.wr.ud = ffi::ibv_send_wr__bindgen_ty_2__bindgen_ty_3 {
+                ah,
+                remote_qpn,
+                remote_qkey,
+            };
+        }
+        self.wrs.push(wr);
+        self.spans.push(Span {
+            sge_start: sge_start as u32,
+            inline,
+        });
+    }
+
+    /// Copies `bufs` into the inline store as one payload and stages its entry, whose `addr` is
+    /// the payload's offset until `link`; an empty payload gets no entry (a null `sg_list` with
+    /// `num_sge` 0, as the extended path passes).
+    #[inline]
+    fn stage_inline<'a>(&mut self, bufs: impl IntoIterator<Item = &'a [u8]>) -> (usize, bool) {
+        let start = self.inline.len();
+        for buf in bufs {
+            self.inline.extend_from_slice(buf);
+        }
+        let len = self.inline.len() - start;
+        if len == 0 {
+            return (0, false);
+        }
+        self.sges.push(ffi::ibv_sge {
+            addr: start as u64,
+            length: len as u32,
+            lkey: 0,
+        });
+        (1, true)
+    }
+
+    /// Links the staged requests into the list `ibv_post_send` walks and resolves their entries to
+    /// pointers; returns the head, null if nothing is staged. Call once per batch: it rebases the
+    /// inline entries' offsets to addresses.
+    ///
+    /// Every link comes from one pointer to each vector (indexing a vector again for each request
+    /// would invalidate the links stored before it, as [`RecvRequest::link`] notes).
+    fn link(&mut self) -> *mut ffi::ibv_send_wr {
+        let n = self.wrs.len();
+        if n == 0 {
+            return ptr::null_mut();
+        }
+        let wrs = self.wrs.as_mut_ptr();
+        let sges = self.sges.as_mut_ptr();
+        let inline_base = self.inline.as_ptr() as u64;
+        for (i, span) in self.spans.iter().enumerate() {
+            let wr = unsafe { &mut *wrs.add(i) };
+            wr.next = if i + 1 < n {
+                unsafe { wrs.add(i + 1) }
+            } else {
+                ptr::null_mut()
+            };
+            wr.sg_list = if wr.num_sge == 0 {
+                ptr::null_mut()
+            } else {
+                let first = unsafe { sges.add(span.sge_start as usize) };
+                if span.inline {
+                    unsafe { (*first).addr += inline_base };
+                }
+                first
+            };
+        }
+        wrs
+    }
+}
+
+/// The error for a failed legacy `ibv_post_send` of `batch`, kept out of line like
+/// [`post_recv_error`]: `bad_wr` is the first request the provider refused, so its index counts
+/// the ones it posted (a null or foreign `bad_wr` counts none). The errno is not promoted to
+/// [`Unsupported`](Error::Unsupported), which would lose that count; ionic returns its errnos
+/// negated.
+#[cold]
+#[inline(never)]
+fn post_send_error(errno: i32, batch: &LegacyBatch, bad_wr: *const ffi::ibv_send_wr) -> Error {
+    let index = (bad_wr as usize).wrapping_sub(batch.wrs.as_ptr() as usize)
+        / std::mem::size_of::<ffi::ibv_send_wr>();
+    let posted = if index < batch.len() {
+        u32::try_from(index).unwrap_or(u32::MAX)
+    } else {
+        0
+    };
+    Error::PostSendBatch {
+        posted,
+        source: io::Error::from_raw_os_error(errno.abs()),
+    }
+}
+
+/// One send operation, as both posting paths consume it: the opcode and its operands, without
+/// the id, flags, address, and payload [`SendOp::build`] adds.
+#[derive(Clone, Copy)]
+pub(crate) enum Op {
+    /// SEND, with an immediate or not.
+    Send { imm: Option<u32> },
+    /// RDMA WRITE into `remote`, with an immediate or not.
+    Write {
+        imm: Option<u32>,
+        remote: RemoteMemorySlice,
+    },
+    /// RDMA READ from `remote`.
+    Read { remote: RemoteMemorySlice },
+    /// Atomic compare-and-swap at `remote`.
+    CompareSwap {
+        remote: RemoteMemorySlice,
+        compare: u64,
+        swap: u64,
+    },
+    /// Atomic fetch-and-add at `remote`.
+    FetchAdd { remote: RemoteMemorySlice, add: u64 },
+}
+
+impl Op {
+    /// The immediate the operation carries, if any.
+    #[inline(always)]
+    fn imm(self) -> Option<u32> {
+        match self {
+            Op::Send { imm } | Op::Write { imm, .. } => imm,
+            Op::Read { .. } | Op::CompareSwap { .. } | Op::FetchAdd { .. } => None,
+        }
+    }
+
+    /// Runs the operation's builder on the extended view `q` (`wr_send`, `wr_rdma_write`, ...).
+    /// The caller has set `q`'s `wr_id` and `wr_flags`, which the builder reads.
+    ///
+    /// # Safety
+    ///
+    /// `q` must be a valid extended queue pair with an open work-request block, and the operation
+    /// one it was created with.
+    #[inline(always)]
+    unsafe fn extended(self, q: *mut ffi::ibv_qp_ex) {
+        unsafe {
+            match self {
+                Op::Send { imm: Some(imm) } => (*q).wr_send_imm.unwrap()(q, imm.to_be()),
+                Op::Send { imm: None } => (*q).wr_send.unwrap()(q),
+                Op::Write {
+                    imm: Some(imm),
+                    remote,
+                } => (*q).wr_rdma_write_imm.unwrap()(q, remote.rkey, remote.addr, imm.to_be()),
+                Op::Write { imm: None, remote } => {
+                    (*q).wr_rdma_write.unwrap()(q, remote.rkey, remote.addr)
+                }
+                Op::Read { remote } => (*q).wr_rdma_read.unwrap()(q, remote.rkey, remote.addr),
+                Op::CompareSwap {
+                    remote,
+                    compare,
+                    swap,
+                } => (*q).wr_atomic_cmp_swp.unwrap()(q, remote.rkey, remote.addr, compare, swap),
+                Op::FetchAdd { remote, add } => {
+                    (*q).wr_atomic_fetch_add.unwrap()(q, remote.rkey, remote.addr, add)
+                }
+            }
+        }
+    }
+}
+
 /// An unconfigured `QueuePair`. Created by [`ProtectionDomain::create_qp`].
 ///
 /// A `QueuePairBuilder` is used to configure a `QueuePair` before it is allocated and initialized.
@@ -495,6 +857,8 @@ pub struct QueuePairBuilder<T: Transport> {
     max_inline_data: u32,
     /// the send operations to request at creation, or the transport's default set
     send_ops: Option<SendOps>,
+    /// what to do on a provider without the extended work-request interface
+    fallback: Fallback,
 
     // carried along to handshake phase
     /// traffic class set in Global Routing Headers, only used if `gid_index` is set.
@@ -564,6 +928,7 @@ impl<T: Transport> QueuePairBuilder<T> {
             max_recv_sge: 1,
             max_inline_data: 0,
             send_ops: None,
+            fallback: Fallback::Never,
 
             service_level: 0,
             bring_up: BringUp { init, rtr, rts },
@@ -740,6 +1105,21 @@ impl<T: Transport> QueuePairBuilder<T> {
         self.send_ops.unwrap_or_else(|| default_send_ops(T::TYPE))
     }
 
+    /// Set what [`build`](Self::build) does on a provider without the extended work-request
+    /// interface (see [`Fallback`]).
+    ///
+    /// Defaults to [`Fallback::Never`].
+    pub fn set_fallback(&mut self, fallback: Fallback) -> &mut Self {
+        self.fallback = fallback;
+        self
+    }
+
+    /// What [`build`](Self::build) does on a provider without the extended work-request interface
+    /// (see [`set_fallback`](Self::set_fallback)).
+    pub fn fallback(&self) -> Fallback {
+        self.fallback
+    }
+
     /// Refuses completion queues or a shared receive queue from another device context than the
     /// protection domain's. libibverbs hands the kernel only their handle numbers, which each
     /// context numbers independently and the kernel looks up in the protection domain's context:
@@ -794,29 +1174,100 @@ impl<T: Transport> QueuePairBuilder<T> {
     }
 
     /// The `ibv_create_qp_ex` creation shared by the `build` of every transport it serves (SRD
-    /// goes through `efadv_create_qp_ex` instead; see `efa.rs`).
+    /// goes through `efadv_create_qp_ex` instead; see `efa.rs`), falling back to `ibv_create_qp`
+    /// where the builder's [`Fallback`] allows and the provider requires.
     fn build_impl(&self) -> Result<PreparedQueuePair<T>> {
         self.check_same_context()?;
+        if self.fallback == Fallback::AlwaysLegacyPostSend {
+            return self.build_legacy();
+        }
         let mut attr = ffi::ibv_qp_init_attr_ex {
             srq: self.srq.as_ref().map_or(ptr::null_mut(), |s| s.as_raw()),
             ..self.init_attr_ex()
         };
+        let qp = unsafe { ffi::ibv_create_qp_ex(self.pd.context().as_raw(), &mut attr) };
+        match nonnull(qp, Error::CreateQueuePair) {
+            Ok(qp) => self.prepared_with(qp, &attr, false),
+            // `EOPNOTSUPP` from a provider without `create_qp_ex` at all (irdma), or
+            // `EPROTONOSUPPORT` from a kernel older than the extended command.
+            Err(Error::Unsupported { .. }) if self.fallback == Fallback::LegacyPostSend => {
+                self.build_legacy()
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The legacy creation (`ibv_create_qp`), for a queue pair that posts through
+    /// `ibv_post_send`: the same attributes, without the send-operations mask the legacy verb
+    /// does not read (the provider validates each operation as it is posted instead).
+    fn build_legacy(&self) -> Result<PreparedQueuePair<T>> {
+        let mut attr = ffi::ibv_qp_init_attr_ex {
+            srq: self.srq.as_ref().map_or(ptr::null_mut(), |s| s.as_raw()),
+            ..self.init_attr_ex()
+        };
+        let mut legacy = ffi::ibv_qp_init_attr {
+            qp_context: attr.qp_context,
+            send_cq: attr.send_cq,
+            recv_cq: attr.recv_cq,
+            srq: attr.srq,
+            cap: attr.cap,
+            qp_type: attr.qp_type,
+            sq_sig_all: attr.sq_sig_all,
+        };
         let qp = nonnull(
-            unsafe { ffi::ibv_create_qp_ex(self.pd.context().as_raw(), &mut attr) },
+            unsafe { ffi::ibv_create_qp(self.pd.as_raw(), &mut legacy) },
             Error::CreateQueuePair,
-        )?;
-        self.prepared(qp, &attr)
+        )
+        .map_err(|e| e.for_operation(&"ibv_create_qp"))?;
+        // Creation wrote the granted capacities back, as the extended verb does into `attr`.
+        attr.cap = legacy.cap;
+        self.prepared_with(qp, &attr, true)
     }
 
     /// Wraps `qp`, just created from `attr`, as the prepared queue pair this builder describes:
     /// the end of every transport's `build`. Creation wrote the granted capacities back into
     /// `attr`, and the queue pair holds the shared receive queue `attr` attached it to, if any.
+    #[cfg(feature = "efa")]
     pub(crate) fn prepared(
         &self,
         qp: *mut ffi::ibv_qp,
         attr: &ffi::ibv_qp_init_attr_ex,
     ) -> Result<PreparedQueuePair<T>> {
-        let qp_ex = unsafe { ffi::ibv_qp_to_qp_ex(qp) };
+        self.prepared_with(qp, attr, false)
+    }
+
+    /// Wraps `qp`, just created from `attr`, as the prepared queue pair this builder describes,
+    /// with the posting path settled: `legacy` for a queue pair created by the legacy verb, which
+    /// has no extended view to ask for; otherwise the extended view if the provider installed its
+    /// work-request table, and the legacy path or an error if not, as the builder's [`Fallback`]
+    /// says.
+    fn prepared_with(
+        &self,
+        qp: *mut ffi::ibv_qp,
+        attr: &ffi::ibv_qp_init_attr_ex,
+        legacy: bool,
+    ) -> Result<PreparedQueuePair<T>> {
+        // `ibv_qp_to_qp_ex` hands out the extended view only when the provider installed the
+        // work-request table; one that accepted the send-operations mask without doing so has
+        // made a queue pair the extended path could never post to.
+        let qp_ex = if legacy || self.fallback == Fallback::AlwaysLegacyPostSend {
+            ptr::null_mut()
+        } else {
+            unsafe { ffi::ibv_qp_to_qp_ex(qp) }
+        };
+        let legacy = qp_ex.is_null();
+        // At most what was asked for: mlx5 writes back a capacity that went negative when the work
+        // request has no room left for an inline segment (`max_send_sge` 0).
+        let max_inline_data = self.max_inline_data.min(attr.cap.max_inline_data);
+        let posting = if legacy {
+            Posting::Legacy(std::cell::UnsafeCell::new(LegacyBatch::with_capacity(
+                attr.cap.max_send_wr,
+                self.max_send_sge,
+                max_inline_data,
+            )))
+        } else {
+            Posting::Extended(qp_ex)
+        };
         let prepared = PreparedQueuePair {
             lid: self.lid,
             roce: self.roce,
@@ -831,10 +1282,8 @@ impl<T: Transport> QueuePairBuilder<T> {
                 _send_cq: self.send.clone(),
                 _recv_cq: self.recv.clone(),
                 qp,
-                qp_ex,
-                // At most what was asked for: mlx5 writes back a capacity that went negative when
-                // the work request has no room left for an inline segment (`max_send_sge` 0).
-                max_inline_data: self.max_inline_data.min(attr.cap.max_inline_data),
+                posting,
+                max_inline_data,
                 max_send_sge: self.max_send_sge,
                 _transport: std::marker::PhantomData,
             },
@@ -843,17 +1292,33 @@ impl<T: Transport> QueuePairBuilder<T> {
             service_level: self.service_level,
             bring_up: self.bring_up.clone(),
         };
-        // `ibv_qp_to_qp_ex` hands out the extended view only when the provider installed the
-        // work-request table; one that accepted the send-operations mask without doing so has
-        // made a queue pair this crate could never post to. Dropping `prepared` destroys it.
-        if qp_ex.is_null() {
+        // Dropping `prepared` destroys the queue pair on the error paths below.
+        if legacy && self.fallback == Fallback::Never {
             return Err(Error::Unsupported {
                 operation: &"ibv_qp_to_qp_ex",
                 errno: nix::libc::EOPNOTSUPP,
             });
         }
+        // Refuse here, rather than at the first post, what the legacy interface cannot express.
+        if legacy && no_legacy_form(T::TYPE, self.send_ops()) {
+            return Err(Error::Unsupported {
+                operation: &"ibv_post_send",
+                errno: nix::libc::EOPNOTSUPP,
+            });
+        }
         Ok(prepared)
     }
+}
+
+/// Whether a queue pair of `qp_type` created for `send_ops` cannot post through the legacy
+/// interface: `ibv_send_wr` has no form for `FLUSH` or `ATOMIC_WRITE`, and none for an SRD queue
+/// pair (`IBV_QPT_DRIVER`) at all. SRD is addressed like a datagram and posts RDMA operations, and
+/// the `wr` union holds either the address or the RDMA operands, not both; EFA's `ibv_post_send`
+/// accepts SEND alone besides. Such a builder gets [`Error::Unsupported`] from the legacy path
+/// instead of a queue pair whose requests would be corrupted or refused when posted.
+fn no_legacy_form(qp_type: ffi::ibv_qp_type, send_ops: SendOps) -> bool {
+    let no_legacy_op = SendOps::FLUSH.0 | SendOps::ATOMIC_WRITE.0;
+    qp_type == ffi::ibv_qp_type::IBV_QPT_DRIVER || send_ops.0 & no_legacy_op != 0
 }
 
 impl<T: Connected> QueuePairBuilder<T> {
@@ -1157,6 +1622,12 @@ impl<T: Transport> PreparedQueuePair<T> {
         self.qp
     }
 
+    /// Whether the queue pair will post its sends through the legacy `ibv_post_send` (see
+    /// [`QueuePair::is_legacy`] and [`Fallback`]).
+    pub fn is_legacy(&self) -> bool {
+        self.qp.is_legacy()
+    }
+
     /// Get the network endpoint for this `QueuePair`.
     ///
     /// This endpoint will need to be communicated to the `QueuePair` on the remote end. On RoCE,
@@ -1454,10 +1925,15 @@ impl<'a> RecvRequest<'a> {
 /// datagram queue pair, at [`to`](Self::to), which also addresses it), is optionally modified
 /// ([`signaled`](SendOp::signaled), [`solicited`](SendOp::solicited), and on RC
 /// [`fenced`](SendOp::fenced)), and ends with the opcode method (`send`, `write`, `read`,
-/// ...) that appends it to the open block immediately, through the extended ("doorbell")
-/// interface. The opcodes available depend on the queue pair's transport (see [`Transport`]).
-/// [`submit`](Self::submit) then rings the doorbell once for the whole batch. Dropping the batch
-/// without submitting aborts it.
+/// ...) that appends it to the batch. The opcodes available depend on the queue pair's transport
+/// (see [`Transport`]). [`submit`](Self::submit) then posts the whole batch at once. Dropping the
+/// batch without submitting aborts it.
+///
+/// How the batch reaches the provider depends on how the queue pair was created (see
+/// [`Fallback`]): through the extended ("doorbell") interface, each opcode method appends to the
+/// provider's open work-request block and `submit` rings the doorbell once; through the legacy
+/// one, the opcode methods stage `ibv_send_wr`s and `submit` posts the list with one
+/// `ibv_post_send`.
 ///
 /// # Borrow-checked guarantees
 ///
@@ -1515,12 +1991,26 @@ impl<'a> RecvRequest<'a> {
 /// queues while holding an open batch either (see [`Completions`](crate::Completions)).
 #[must_use = "a started batch must be `.submit()`ed (otherwise it is aborted on drop)"]
 pub struct SendBatch<'qp, T: Transport> {
-    qpx: *mut ffi::ibv_qp_ex,
+    backend: Backend<'qp>,
+    /// The queue pair's protection domain, which a datagram request's address handle must share.
+    pd: *mut ffi::ibv_pd,
     max_inline_data: u32,
     max_send_sge: u32,
     // Opened through a shared borrow (`QueuePair::open_batch`); what keeps a second batch out is
     // that every caller holds the send queue exclusively.
     _qp: std::marker::PhantomData<&'qp QueuePair<T>>,
+}
+
+/// The open batch's side of [`Posting`]: where the requests go as they are built.
+enum Backend<'qp> {
+    /// The provider's open work-request block, between `wr_start` and `wr_complete`/`wr_abort`.
+    Extended(*mut ffi::ibv_qp_ex),
+    /// The queue pair's staging area, cleared when the batch was opened, and the queue pair to
+    /// post it to.
+    Legacy {
+        qp: *mut ffi::ibv_qp,
+        buf: &'qp mut LegacyBatch,
+    },
 }
 
 impl<'qp, T: Connected> SendBatch<'qp, T> {
@@ -1569,7 +2059,7 @@ impl<'qp, T: Datagram> SendBatch<'qp, T> {
     ) -> SendOp<'b, 'qp, T> {
         // One protection domain implies one device context.
         assert!(
-            unsafe { (*ah.as_raw()).pd == (*self.qpx).qp_base.pd },
+            unsafe { (*ah.as_raw()).pd } == self.pd,
             "the address handle must come from the queue pair's protection domain"
         );
         SendOp {
@@ -1582,7 +2072,8 @@ impl<'qp, T: Datagram> SendBatch<'qp, T> {
 }
 
 impl<'qp, T: Transport> SendBatch<'qp, T> {
-    /// Post the whole batch to the device, ringing the doorbell once.
+    /// Post the whole batch to the device: one doorbell through the extended interface, one
+    /// `ibv_post_send` through the legacy one (see [`Fallback`]).
     ///
     /// # Safety
     ///
@@ -1597,32 +2088,59 @@ impl<'qp, T: Transport> SendBatch<'qp, T> {
     /// - on mlx5, a request added while the send queue is full rewrites the last request posted
     ///   before it, so never have more requests outstanding than the queue's capacity;
     /// - hns devices in owner-doorbell mode may execute each request as soon as its opcode method
-    ///   returns, before `submit` and even if the batch is dropped.
+    ///   returns, before `submit` and even if the batch is dropped;
+    /// - through the legacy interface, the requests ahead of the one that failed were posted (the
+    ///   error's `posted` counts them).
     ///
     /// # Errors
     ///
-    ///  - [`PostSend`](Error::PostSend): completing the batch failed (`EINVAL` for an invalid
-    ///    value in one of the work requests, `ENOMEM` when out of resources or when the send queue
-    ///    was full, which on mlx5 also corrupted a posted request; see Safety).
+    ///  - [`PostSend`](Error::PostSend): completing the batch failed on the extended interface
+    ///    (`EINVAL` for an invalid value in one of the work requests, `ENOMEM` when out of
+    ///    resources or when the send queue was full, which on mlx5 also corrupted a posted request;
+    ///    see Safety). Nothing was posted.
+    ///  - [`PostSendBatch`](Error::PostSendBatch): `ibv_post_send` failed at one of the requests
+    ///    on the legacy interface (same errnos); its `posted` counts the requests at the front of
+    ///    the batch that were posted before it.
     pub unsafe fn submit(self) -> Result<()> {
-        let qpx = self.qpx;
-        // Disarm the abort-on-drop before completing: `Drop` would otherwise `wr_abort` the block we
-        // are about to `wr_complete`.
-        std::mem::forget(self);
-        let ret = unsafe { (*qpx).wr_complete.unwrap()(qpx) };
-        if ret != 0 {
-            Err(Error::errno(ret, Error::PostSend))
-        } else {
-            Ok(())
+        // Disarm the abort-on-drop before completing: `Drop` would otherwise `wr_abort` the block
+        // we are about to `wr_complete` (or clear the staged requests before they are posted).
+        let mut this = std::mem::ManuallyDrop::new(self);
+        match &mut this.backend {
+            Backend::Extended(qpx) => {
+                let qpx = *qpx;
+                let ret = unsafe { (*qpx).wr_complete.unwrap()(qpx) };
+                if ret != 0 {
+                    Err(Error::errno(ret, Error::PostSend))
+                } else {
+                    Ok(())
+                }
+            }
+            Backend::Legacy { qp, buf } => {
+                let head = buf.link();
+                if head.is_null() {
+                    // Nothing was staged; the provider has nothing to post.
+                    return Ok(());
+                }
+                let mut bad_wr: *mut ffi::ibv_send_wr = ptr::null_mut();
+                let errno = unsafe { ffi::ibv_post_send(*qp, head, &mut bad_wr) };
+                if errno != 0 {
+                    Err(post_send_error(errno, buf, bad_wr))
+                } else {
+                    Ok(())
+                }
+            }
         }
     }
 }
 
 impl<T: Transport> Drop for SendBatch<'_, T> {
     fn drop(&mut self) {
-        // Reached only when the batch was started (`wr_start`) but not submitted; `submit` forgets
-        // the batch to skip this. Abort the open work-request block.
-        unsafe { (*self.qpx).wr_abort.unwrap()(self.qpx) };
+        // Reached only when the batch was started but not submitted; `submit` skips this. Abort
+        // the provider's open work-request block, or forget the staged requests.
+        match &mut self.backend {
+            Backend::Extended(qpx) => unsafe { (**qpx).wr_abort.unwrap()(*qpx) },
+            Backend::Legacy { buf, .. } => buf.clear(),
+        }
     }
 }
 
@@ -1668,7 +2186,7 @@ impl<T: Transport> SendOp<'_, '_, T> {
     #[inline]
     pub fn send<'a>(self, wr_id: u64, payload: impl Into<Payload<'a>>) {
         let imm = self.imm;
-        self.build(wr_id, payload.into(), Self::send_op(imm))
+        self.build(wr_id, payload.into(), Op::Send { imm })
     }
 
     /// Set the solicited flag; the transports that allow it expose this as `solicited`.
@@ -1690,20 +2208,16 @@ impl<T: Transport> SendOp<'_, '_, T> {
         self
     }
 
-    /// Post one work request: set id and flags, run the opcode builder, then the optional datagram
-    /// address, then the payload.
+    /// Post one work request on the batch's backend: through the extended interface, set id and
+    /// flags, run the opcode builder, then the optional datagram address, then the payload;
+    /// through the legacy one, stage the equivalent `ibv_send_wr`.
     ///
     /// Always inlined: once an opcode has more than one call site, LLVM otherwise outlines this,
     /// and every work request then pays a call plus runtime branches on the destination and the
-    /// payload kind that the inlined form folds away at compile time.
+    /// payload kind that the inlined form folds away at compile time. The branch on the backend
+    /// remains, one well-predicted test per request.
     #[inline(always)]
-    pub(crate) fn build(
-        self,
-        wr_id: u64,
-        payload: Payload<'_>,
-        op: impl FnOnce(*mut ffi::ibv_qp_ex),
-    ) {
-        let qpx = self.batch.qpx;
+    pub(crate) fn build(self, wr_id: u64, payload: Payload<'_>, op: Op) {
         // Not every provider checks a payload against the queue pair's capacities before writing
         // it into the send queue, so refuse one that does not fit. rxe before rdma-core 64 checks
         // each buffer of an inline list alone, hns sums inline lengths in a u32, and mlx5's
@@ -1723,19 +2237,27 @@ impl<T: Transport> SendOp<'_, '_, T> {
         if sges > self.batch.max_send_sge as usize {
             too_many_sges(sges, self.batch.max_send_sge);
         }
+        let flags = match payload {
+            Payload::Sges(_) => self.flags,
+            // `IBV_SEND_INLINE` is the work-request flag that marks the payload as inline, as the
+            // legacy `ibv_post_send` ABI carries it (and requires). Soft-RoCE copies the
+            // work-request flags into the request verbatim and needs it on the extended path too;
+            // the other providers key off the `wr_set_inline_data` call itself, so the flag is
+            // redundant but harmless there.
+            Payload::Inline(_) | Payload::InlineList(_) => {
+                self.flags | ffi::ibv_send_flags::IBV_SEND_INLINE.0
+            }
+        };
+        let qpx = match &mut self.batch.backend {
+            Backend::Extended(qpx) => *qpx,
+            Backend::Legacy { buf, .. } => {
+                return buf.push(wr_id, flags, op, self.dest, payload);
+            }
+        };
         unsafe {
             (*qpx).wr_id = wr_id;
-            (*qpx).wr_flags = match payload {
-                Payload::Sges(_) => self.flags,
-                // `IBV_SEND_INLINE` is the work-request flag that marks the payload as inline, as
-                // the legacy `ibv_post_send` ABI carries it. Soft-RoCE copies the work-request
-                // flags into the request verbatim and needs it; the other providers key off the
-                // `wr_set_inline_data` call itself, so the flag is redundant but harmless there.
-                Payload::Inline(_) | Payload::InlineList(_) => {
-                    self.flags | ffi::ibv_send_flags::IBV_SEND_INLINE.0
-                }
-            };
-            op(qpx);
+            (*qpx).wr_flags = flags;
+            op.extended(qpx);
             if let Some((ah, qpn, qkey)) = self.dest {
                 (*qpx).wr_set_ud_addr.unwrap()(qpx, ah, qpn, qkey);
             }
@@ -1785,40 +2307,6 @@ impl<T: Transport> SendOp<'_, '_, T> {
             }
         }
     }
-
-    /// The opcode builder for a SEND, with or without the immediate set by [`imm`](Self::imm).
-    #[inline]
-    fn send_op(imm: Option<u32>) -> impl FnOnce(*mut ffi::ibv_qp_ex) + use<T> {
-        move |q| unsafe {
-            match imm {
-                Some(imm) => (*q).wr_send_imm.unwrap()(q, imm.to_be()),
-                None => (*q).wr_send.unwrap()(q),
-            }
-        }
-    }
-
-    /// The opcode builder for an RDMA WRITE into `remote`, with or without the immediate set by
-    /// [`imm`](Self::imm).
-    #[inline]
-    pub(crate) fn write_op(
-        imm: Option<u32>,
-        remote: RemoteMemorySlice,
-    ) -> impl FnOnce(*mut ffi::ibv_qp_ex) + use<T> {
-        move |q| unsafe {
-            match imm {
-                Some(imm) => {
-                    (*q).wr_rdma_write_imm.unwrap()(q, remote.rkey, remote.addr, imm.to_be())
-                }
-                None => (*q).wr_rdma_write.unwrap()(q, remote.rkey, remote.addr),
-            }
-        }
-    }
-
-    /// The opcode builder for an RDMA READ from `remote`.
-    #[inline]
-    pub(crate) fn read_op(remote: RemoteMemorySlice) -> impl FnOnce(*mut ffi::ibv_qp_ex) + use<T> {
-        move |q| unsafe { (*q).wr_rdma_read.unwrap()(q, remote.rkey, remote.addr) }
-    }
 }
 
 impl<T: Connected> SendOp<'_, '_, T> {
@@ -1845,7 +2333,7 @@ impl<T: Connected> SendOp<'_, '_, T> {
     #[inline]
     pub fn write<'a>(self, wr_id: u64, payload: impl Into<Payload<'a>>, remote: RemoteMemorySlice) {
         let imm = self.imm;
-        self.build(wr_id, payload.into(), Self::write_op(imm, remote))
+        self.build(wr_id, payload.into(), Op::Write { imm, remote })
     }
 }
 
@@ -1868,7 +2356,7 @@ impl<T: Reliable> SendOp<'_, '_, T> {
     /// ([`QueuePairBuilder::set_max_send_sge`]).
     #[inline]
     pub fn read(self, wr_id: u64, local: &[LocalMemorySlice], remote: RemoteMemorySlice) {
-        self.build(wr_id, Payload::Sges(local), Self::read_op(remote))
+        self.build(wr_id, Payload::Sges(local), Op::Read { remote })
     }
 
     /// Post an atomic compare-and-swap on the 8-byte value at `remote`: if it equals `compare`, it
@@ -1890,9 +2378,15 @@ impl<T: Reliable> SendOp<'_, '_, T> {
         compare: u64,
         swap: u64,
     ) {
-        self.atomic(wr_id, local, move |q| unsafe {
-            (*q).wr_atomic_cmp_swp.unwrap()(q, remote.rkey, remote.addr, compare, swap)
-        })
+        self.atomic(
+            wr_id,
+            local,
+            Op::CompareSwap {
+                remote,
+                compare,
+                swap,
+            },
+        )
     }
 
     /// Post an atomic fetch-and-add on the 8-byte value at `remote`: `add` is added to it. The
@@ -1913,16 +2407,14 @@ impl<T: Reliable> SendOp<'_, '_, T> {
         remote: RemoteMemorySlice,
         add: u64,
     ) {
-        self.atomic(wr_id, local, move |q| unsafe {
-            (*q).wr_atomic_fetch_add.unwrap()(q, remote.rkey, remote.addr, add)
-        })
+        self.atomic(wr_id, local, Op::FetchAdd { remote, add })
     }
 
     /// Post the atomic `op`, whose original value lands in `local`. Not every provider checks
     /// that buffer: rxe applies the atomic remotely and only then fails it on a shorter one,
     /// moving the queue pair to the error state, so refuse anything but the 8 bytes written.
     #[inline(always)]
-    fn atomic(self, wr_id: u64, local: LocalMemorySlice, op: impl FnOnce(*mut ffi::ibv_qp_ex)) {
+    fn atomic(self, wr_id: u64, local: LocalMemorySlice, op: Op) {
         if local.len() != 8 {
             atomic_local_not_8_bytes(local.len());
         }
@@ -2519,9 +3011,9 @@ pub struct QueuePair<T: Transport = Rc> {
     _send_cq: CompletionQueue,
     _recv_cq: CompletionQueue,
     qp: *mut ffi::ibv_qp,
-    // The extended (doorbell) view of `qp`, used by the send path. `ibv_qp_to_qp_ex` is a cast, so
-    // this aliases `qp` and lives exactly as long.
-    qp_ex: *mut ffi::ibv_qp_ex,
+    // How the send path reaches the provider: the extended (doorbell) view of `qp`, or the staging
+    // area of the legacy path (see `Fallback`).
+    posting: Posting,
     // The inline capacity the builder asked for (capped at what the provider granted), which the
     // send path enforces (`SendOp::build`).
     max_inline_data: u32,
@@ -2546,22 +3038,35 @@ impl<T: Transport> QueuePair<T> {
         self._srq.is_some()
     }
 
+    /// Whether this queue pair posts its sends through the legacy `ibv_post_send` rather than the
+    /// extended work-request interface: the builder's [`Fallback`] allowed it and the provider
+    /// required it (or the builder asked for it outright). See [`Fallback`] for what differs.
+    pub fn is_legacy(&self) -> bool {
+        matches!(self.posting, Posting::Legacy(_))
+    }
+
     /// Returns the underlying `ibv_qp` pointer.
     ///
     /// This is an escape hatch for verbs this crate does not yet wrap. The send path uses the
-    /// extended (doorbell) interface; see [`as_raw_ex`](Self::as_raw_ex) for that view. The pointer
-    /// is owned by this [`QueuePair`] and stays valid only while it is alive; do not destroy it.
+    /// extended (doorbell) interface where the provider has it; see [`as_raw_ex`](Self::as_raw_ex)
+    /// for that view. The pointer is owned by this [`QueuePair`] and stays valid only while it is
+    /// alive; do not destroy it.
     pub fn as_raw(&self) -> *mut ffi::ibv_qp {
         self.qp
     }
 
-    /// Returns the underlying `ibv_qp_ex` pointer (the extended/doorbell view of this queue pair).
+    /// Returns the underlying `ibv_qp_ex` pointer (the extended/doorbell view of this queue pair),
+    /// or null on a queue pair that posts through the legacy interface
+    /// ([`is_legacy`](Self::is_legacy)), which has no such view.
     ///
     /// This is an escape hatch for verbs this crate does not yet wrap. `ibv_qp_to_qp_ex` is a cast,
     /// so this aliases [`as_raw`](Self::as_raw) and lives exactly as long. The pointer stays valid
     /// only while this [`QueuePair`] is alive; do not destroy it.
     pub fn as_raw_ex(&self) -> *mut ffi::ibv_qp_ex {
-        self.qp_ex
+        match self.posting {
+            Posting::Extended(qp_ex) => qp_ex,
+            Posting::Legacy(_) => ptr::null_mut(),
+        }
     }
 
     /// Modify this queue pair's attributes (`ibv_modify_qp`).
@@ -2782,15 +3287,31 @@ impl<T: Transport> QueuePair<T> {
         (SendQueue { qp: self }, self)
     }
 
-    /// Opens a work-request block on the send queue (`wr_start`). Every caller holds the send
-    /// queue exclusively (a `&mut` to the queue pair or to its [`SendQueue`]), which is what keeps
-    /// at most one block open at a time.
+    /// Opens a batch on the send queue: a work-request block on the provider (`wr_start`), or the
+    /// queue pair's cleared staging area on the legacy path. Every caller holds the send queue
+    /// exclusively (a `&mut` to the queue pair or to its [`SendQueue`]), which is what keeps at
+    /// most one batch open at a time — and, on the legacy path, what makes the mutable borrow of
+    /// the staging area through `&self` sound (see [`Posting::Legacy`]).
     #[inline]
     fn open_batch(&self) -> SendBatch<'_, T> {
-        let qpx = self.qp_ex;
-        unsafe { (*qpx).wr_start.unwrap()(qpx) };
+        let backend = match &self.posting {
+            Posting::Extended(qpx) => {
+                let qpx = *qpx;
+                unsafe { (*qpx).wr_start.unwrap()(qpx) };
+                Backend::Extended(qpx)
+            }
+            Posting::Legacy(cell) => {
+                // SAFETY: the caller holds the send queue exclusively (see above), so no other
+                // reference to the staging area exists while the returned batch, which borrows
+                // `self` for as long as it lives, is open.
+                let buf = unsafe { &mut *cell.get() };
+                buf.clear();
+                Backend::Legacy { qp: self.qp, buf }
+            }
+        };
         SendBatch {
-            qpx,
+            backend,
+            pd: unsafe { (*self.qp).pd },
             max_inline_data: self.max_inline_data,
             max_send_sge: self.max_send_sge,
             _qp: std::marker::PhantomData,
@@ -2983,20 +3504,27 @@ mod test_recv_link {
         assert_eq!(recv_with_sge.wr.num_sge, 1);
     }
 
+    /// A batch on `spy`'s extended view, as `open_batch` would make one.
+    fn spy_batch(spy: &mut SpyQpEx) -> SendBatch<'_, Rc> {
+        SendBatch {
+            backend: Backend::Extended((&raw mut *spy).cast::<ffi::ibv_qp_ex>()),
+            pd: ptr::null_mut(),
+            max_inline_data: 64,
+            max_send_sge: 1,
+            _qp: std::marker::PhantomData,
+        }
+    }
+
     // Posting a send operation with an empty SGE slice passes a null pointer and zero count to
     // `wr_set_sge_list` rather than `NonNull::dangling()`.
     #[test]
     fn send_op_with_empty_sge_slice_passes_null_pointer_to_provider() {
         let mut spy = SpyQpEx::new();
-        let mut batch = SendBatch::<Rc> {
-            qpx: (&raw mut spy).cast::<ffi::ibv_qp_ex>(),
-            max_inline_data: 64,
-            max_send_sge: 1,
-            _qp: std::marker::PhantomData,
-        };
+        let mut batch = spy_batch(&mut spy);
 
         let empty_sges: &[LocalMemorySlice] = &[];
         batch.op().send(1, empty_sges);
+        drop(batch);
         assert_eq!(spy.last_sge_len, 0);
         assert!(spy.last_sge_ptr.is_null());
     }
@@ -3006,14 +3534,10 @@ mod test_recv_link {
     #[test]
     fn send_op_with_empty_inline_slice_passes_null_pointer_to_provider() {
         let mut spy = SpyQpEx::new();
-        let mut batch = SendBatch::<Rc> {
-            qpx: (&raw mut spy).cast::<ffi::ibv_qp_ex>(),
-            max_inline_data: 64,
-            max_send_sge: 1,
-            _qp: std::marker::PhantomData,
-        };
+        let mut batch = spy_batch(&mut spy);
 
         batch.op().send(2, Payload::Inline(&[]));
+        drop(batch);
         assert_eq!(spy.last_inline_len, 0);
         assert!(spy.last_inline_ptr.is_null());
     }
@@ -3023,17 +3547,368 @@ mod test_recv_link {
     #[test]
     fn send_op_with_empty_inline_list_passes_null_pointer_to_provider() {
         let mut spy = SpyQpEx::new();
-        let mut batch = SendBatch::<Rc> {
-            qpx: (&raw mut spy).cast::<ffi::ibv_qp_ex>(),
-            max_inline_data: 64,
-            max_send_sge: 1,
-            _qp: std::marker::PhantomData,
-        };
+        let mut batch = spy_batch(&mut spy);
 
         let empty_iov: &[io::IoSlice<'_>] = &[];
         batch.op().send(3, Payload::InlineList(empty_iov));
+        drop(batch);
         assert_eq!(spy.last_inline_list_len, 0);
         assert!(spy.last_inline_list_ptr.is_null());
+    }
+}
+
+/// The legacy posting path, up to the `ibv_post_send` call: what the opcode methods stage, and
+/// what `link` hands the provider.
+#[cfg(test)]
+mod test_legacy_batch {
+    use super::*;
+
+    /// A batch over `buf`, as `open_batch` would make one on a legacy queue pair, for the
+    /// transport `T`. `qp` is never dereferenced by the staging code; it is passed to
+    /// `ibv_post_send` by `submit` alone, which these tests do not call.
+    fn legacy_batch<T: Transport>(buf: &mut LegacyBatch) -> SendBatch<'_, T> {
+        SendBatch {
+            backend: Backend::Legacy {
+                qp: ptr::null_mut(),
+                buf,
+            },
+            pd: ptr::null_mut(),
+            max_inline_data: 64,
+            max_send_sge: 4,
+            _qp: std::marker::PhantomData,
+        }
+    }
+
+    fn sge(addr: u64, length: u32, lkey: u32) -> LocalMemorySlice {
+        LocalMemorySlice::from(ffi::ibv_sge { addr, length, lkey })
+    }
+
+    const REMOTE: RemoteMemorySlice = RemoteMemorySlice {
+        addr: 0x1000,
+        len: 64,
+        rkey: 0x42,
+    };
+
+    /// The staged requests of `buf` as `ibv_post_send` would walk them, after `link`.
+    fn walk(buf: &mut LegacyBatch) -> Vec<*mut ffi::ibv_send_wr> {
+        let mut out = Vec::new();
+        let mut wr = buf.link();
+        while !wr.is_null() {
+            out.push(wr);
+            wr = unsafe { (*wr).next };
+        }
+        out
+    }
+
+    #[test]
+    fn empty_batch_links_to_nothing() {
+        let mut buf = LegacyBatch::with_capacity(1, 1, 0);
+        assert!(buf.link().is_null());
+        assert_eq!(buf.len(), 0);
+    }
+
+    #[test]
+    fn every_opcode_stages_its_send_wr() {
+        use ffi::ibv_wr_opcode as O;
+        let mut buf = LegacyBatch::with_capacity(8, 4, 64);
+        let local = [sge(0x10, 8, 1), sge(0x20, 16, 2)];
+        let one = [sge(0x30, 8, 3)];
+        {
+            let mut batch = legacy_batch::<Rc>(&mut buf);
+            batch.op().send(1, &local);
+            batch.op().imm(0x0102_0304).signaled().send(2, &one);
+            batch.op().write(3, &local, REMOTE);
+            batch.op().imm(7).solicited().write(4, &one, REMOTE);
+            batch.op().fenced().read(5, &one, REMOTE);
+            batch.op().atomic_cmp_swap(6, one[0], REMOTE, 10, 20);
+            batch.op().atomic_fetch_add(7, one[0], REMOTE, 30);
+            std::mem::forget(batch);
+        }
+        let wrs = walk(&mut buf);
+        assert_eq!(wrs.len(), 7);
+        let wr = |i: usize| unsafe { &*wrs[i] };
+
+        assert_eq!(wr(0).wr_id, 1);
+        assert_eq!(wr(0).opcode, O::IBV_WR_SEND);
+        assert_eq!(wr(0).send_flags, 0);
+        assert_eq!(wr(0).num_sge, 2);
+        // The entries were copied, in order, and `sg_list` points at the copies.
+        let copied = unsafe { std::slice::from_raw_parts(wr(0).sg_list, 2) };
+        assert_eq!(
+            (copied[0].addr, copied[0].length, copied[0].lkey),
+            (0x10, 8, 1)
+        );
+        assert_eq!(
+            (copied[1].addr, copied[1].length, copied[1].lkey),
+            (0x20, 16, 2)
+        );
+        assert_ne!(
+            wr(0).sg_list as *const _,
+            local.as_ptr().cast::<ffi::ibv_sge>()
+        );
+
+        assert_eq!(wr(1).opcode, O::IBV_WR_SEND_WITH_IMM);
+        assert_eq!(wr(1).send_flags, ffi::ibv_send_flags::IBV_SEND_SIGNALED.0);
+        assert_eq!(
+            unsafe { wr(1).__bindgen_anon_1.imm_data },
+            0x0102_0304u32.to_be()
+        );
+
+        assert_eq!(wr(2).opcode, O::IBV_WR_RDMA_WRITE);
+        assert_eq!(unsafe { wr(2).wr.rdma.remote_addr }, REMOTE.addr);
+        assert_eq!(unsafe { wr(2).wr.rdma.rkey }, REMOTE.rkey);
+
+        assert_eq!(wr(3).opcode, O::IBV_WR_RDMA_WRITE_WITH_IMM);
+        assert_eq!(wr(3).send_flags, ffi::ibv_send_flags::IBV_SEND_SOLICITED.0);
+        assert_eq!(unsafe { wr(3).__bindgen_anon_1.imm_data }, 7u32.to_be());
+
+        assert_eq!(wr(4).opcode, O::IBV_WR_RDMA_READ);
+        assert_eq!(wr(4).send_flags, ffi::ibv_send_flags::IBV_SEND_FENCE.0);
+        assert_eq!(unsafe { wr(4).wr.rdma.remote_addr }, REMOTE.addr);
+
+        assert_eq!(wr(5).opcode, O::IBV_WR_ATOMIC_CMP_AND_SWP);
+        assert_eq!(unsafe { wr(5).wr.atomic.compare_add }, 10);
+        assert_eq!(unsafe { wr(5).wr.atomic.swap }, 20);
+        assert_eq!(unsafe { wr(5).wr.atomic.rkey }, REMOTE.rkey);
+        assert_eq!(wr(5).num_sge, 1);
+
+        assert_eq!(wr(6).opcode, O::IBV_WR_ATOMIC_FETCH_AND_ADD);
+        assert_eq!(unsafe { wr(6).wr.atomic.compare_add }, 30);
+        assert_eq!(unsafe { wr(6).wr.atomic.swap }, 0);
+        assert!(wr(6).next.is_null());
+    }
+
+    #[test]
+    fn inline_payloads_are_copied_and_rebased_at_link() {
+        let mut buf = LegacyBatch::with_capacity(4, 1, 64);
+        {
+            // The caller's bytes may be gone by the time the batch is posted: scoped so they are.
+            let bytes = *b"ping";
+            let parts = [io::IoSlice::new(b"ab"), io::IoSlice::new(b"cde")];
+            let mut batch = legacy_batch::<Rc>(&mut buf);
+            batch.op().send(1, Payload::Inline(&bytes));
+            batch.op().send(2, Payload::InlineList(&parts));
+            batch.op().send(3, Payload::Inline(&[]));
+            std::mem::forget(batch);
+        }
+        let wrs = walk(&mut buf);
+        assert_eq!(wrs.len(), 3);
+        let wr = |i: usize| unsafe { &*wrs[i] };
+        for i in 0..3 {
+            assert_eq!(
+                wr(i).send_flags & ffi::ibv_send_flags::IBV_SEND_INLINE.0,
+                ffi::ibv_send_flags::IBV_SEND_INLINE.0
+            );
+        }
+        let inline_of = |i: usize| unsafe {
+            let sge = &*wr(i).sg_list;
+            assert_eq!(sge.lkey, 0);
+            std::slice::from_raw_parts(sge.addr as *const u8, sge.length as usize)
+        };
+        assert_eq!(wr(0).num_sge, 1);
+        assert_eq!(inline_of(0), b"ping");
+        assert_eq!(wr(1).num_sge, 1);
+        assert_eq!(inline_of(1), b"abcde");
+        // An empty inline payload posts no entry at all, like the extended path.
+        assert_eq!(wr(2).num_sge, 0);
+        assert!(wr(2).sg_list.is_null());
+        // The rebased addresses point into the batch's own store, not at the originals.
+        let store = buf.inline.as_ptr() as usize;
+        let addr = unsafe { (*(*wrs[0]).sg_list).addr } as usize;
+        assert!((store..store + buf.inline.len()).contains(&addr));
+    }
+
+    #[test]
+    fn datagram_requests_carry_their_address() {
+        let mut buf = LegacyBatch::with_capacity(2, 1, 0);
+        let one = [sge(0x30, 8, 3)];
+        // `to` asserts the handle's protection domain, which needs a real handle; stage through
+        // `push` with the same arguments `to` would pass instead.
+        let ah = 0x5000usize as *mut ffi::ibv_ah;
+        buf.push(
+            9,
+            0,
+            Op::Send { imm: None },
+            Some((ah, 0x11, 0x22)),
+            Payload::Sges(&one),
+        );
+        let wrs = walk(&mut buf);
+        let wr = unsafe { &*wrs[0] };
+        assert_eq!(wr.wr_id, 9);
+        assert_eq!(unsafe { wr.wr.ud.ah }, ah);
+        assert_eq!(unsafe { wr.wr.ud.remote_qpn }, 0x11);
+        assert_eq!(unsafe { wr.wr.ud.remote_qkey }, 0x22);
+    }
+
+    #[test]
+    fn empty_sge_slice_stages_null_sg_list() {
+        let mut buf = LegacyBatch::with_capacity(1, 1, 0);
+        {
+            let mut batch = legacy_batch::<Rc>(&mut buf);
+            let empty: &[LocalMemorySlice] = &[];
+            batch.op().send(1, empty);
+            std::mem::forget(batch);
+        }
+        let wrs = walk(&mut buf);
+        assert_eq!(unsafe { (*wrs[0]).num_sge }, 0);
+        assert!(unsafe { (*wrs[0]).sg_list }.is_null());
+    }
+
+    #[test]
+    fn dropping_a_batch_clears_it_and_reopening_starts_empty() {
+        let mut buf = LegacyBatch::with_capacity(2, 1, 0);
+        let one = [sge(0x30, 8, 3)];
+        {
+            let mut batch = legacy_batch::<Rc>(&mut buf);
+            batch.op().send(1, &one);
+            batch.op().send(2, &one);
+            // Dropped without `submit`: aborted.
+        }
+        assert_eq!(buf.len(), 0);
+        assert!(buf.sges.is_empty());
+        assert!(buf.link().is_null());
+    }
+
+    #[test]
+    fn staging_past_the_initial_capacity_keeps_links_valid() {
+        // Start small so every vector reallocates while the batch is built; `link` must resolve
+        // indices against the final buffers.
+        let mut buf = LegacyBatch::with_capacity(1, 1, 1);
+        let n = 100;
+        let sges: Vec<_> = (0..n).map(|i| [sge(i as u64, 1, 1)]).collect();
+        let payload = vec![0xAB_u8; 8];
+        {
+            let mut batch = legacy_batch::<Rc>(&mut buf);
+            for (i, s) in sges.iter().enumerate() {
+                if i % 2 == 0 {
+                    batch.op().send(i as u64, s);
+                } else {
+                    batch.op().send(i as u64, Payload::Inline(&payload));
+                }
+            }
+            std::mem::forget(batch);
+        }
+        let wrs = walk(&mut buf);
+        assert_eq!(wrs.len(), n);
+        for (i, &wr) in wrs.iter().enumerate() {
+            let wr = unsafe { &*wr };
+            assert_eq!(wr.wr_id, i as u64);
+            assert_eq!(wr.num_sge, 1);
+            let sge = unsafe { &*wr.sg_list };
+            if i % 2 == 0 {
+                assert_eq!(sge.addr, i as u64);
+            } else {
+                let bytes = unsafe { std::slice::from_raw_parts(sge.addr as *const u8, 8) };
+                assert_eq!(bytes, &payload[..]);
+            }
+        }
+    }
+
+    #[test]
+    fn post_send_error_counts_the_requests_ahead_of_bad_wr() {
+        let mut buf = LegacyBatch::with_capacity(3, 1, 0);
+        let one = [sge(0x30, 8, 3)];
+        {
+            let mut batch = legacy_batch::<Rc>(&mut buf);
+            batch.op().send(1, &one);
+            batch.op().send(2, &one);
+            batch.op().send(3, &one);
+            std::mem::forget(batch);
+        }
+        let wrs = walk(&mut buf);
+        let posted = |bad_wr: *const ffi::ibv_send_wr| match post_send_error(
+            nix::libc::ENOMEM,
+            &buf,
+            bad_wr,
+        ) {
+            Error::PostSendBatch { posted, source } => {
+                assert_eq!(source.raw_os_error(), Some(nix::libc::ENOMEM));
+                posted
+            }
+            other => panic!("unexpected error {other:?}"),
+        };
+        assert_eq!(posted(wrs[0]), 0);
+        assert_eq!(posted(wrs[1]), 1);
+        assert_eq!(posted(wrs[2]), 2);
+        // A provider that refuses the batch up front without naming a request posted none.
+        assert_eq!(posted(ptr::null()), 0);
+        // Negated errnos (ionic) are normalised; an unsupported one keeps the count.
+        assert!(matches!(
+            post_send_error(-nix::libc::EOPNOTSUPP, &buf, wrs[2]),
+            Error::PostSendBatch { posted: 2, ref source } if source.raw_os_error() == Some(nix::libc::EOPNOTSUPP)
+        ));
+    }
+
+    /// What `prepared_with` refuses on the legacy path: SRD regardless of its operations, and
+    /// the two operations `ibv_send_wr` cannot encode on any transport.
+    #[test]
+    fn srd_and_unencodable_ops_have_no_legacy_form() {
+        use sealed::Sealed as _;
+        let defaults = |t: ffi::ibv_qp_type| default_send_ops(t);
+
+        // Every other transport's default set has a legacy form.
+        assert!(!no_legacy_form(Rc::TYPE, defaults(Rc::TYPE)));
+        assert!(!no_legacy_form(Uc::TYPE, defaults(Uc::TYPE)));
+        assert!(!no_legacy_form(Ud::TYPE, defaults(Ud::TYPE)));
+
+        // SRD (`IBV_QPT_DRIVER`) is refused with its defaults (which include RDMA) and even with
+        // SEND alone: EFA's `ibv_post_send` is not a path this crate offers for it.
+        let srd = ffi::ibv_qp_type::IBV_QPT_DRIVER;
+        #[cfg(feature = "efa")]
+        assert_eq!(crate::Srd::TYPE, srd);
+        assert!(no_legacy_form(srd, defaults(srd)));
+        assert!(no_legacy_form(srd, SendOps::SEND));
+
+        // FLUSH and ATOMIC_WRITE are refused wherever they are requested.
+        assert!(no_legacy_form(Rc::TYPE, SendOps::SEND | SendOps::FLUSH));
+        assert!(no_legacy_form(
+            Rc::TYPE,
+            SendOps::SEND | SendOps::ATOMIC_WRITE
+        ));
+    }
+
+    /// An addressed request shares the `wr` union between the address and the RDMA operands, so
+    /// staging anything but a SEND with a destination is caught (in debug builds) rather than
+    /// silently overwriting the remote address and key.
+    #[test]
+    #[cfg_attr(not(debug_assertions), ignore = "the guard is a debug_assert")]
+    #[should_panic(expected = "an addressed legacy request must be a SEND")]
+    fn addressed_rdma_request_is_caught_before_it_corrupts_the_union() {
+        let mut buf = LegacyBatch::with_capacity(1, 1, 0);
+        let one = [sge(0x30, 8, 3)];
+        let ah = 0x5000usize as *mut ffi::ibv_ah;
+        buf.push(
+            1,
+            0,
+            Op::Write {
+                imm: None,
+                remote: REMOTE,
+            },
+            Some((ah, 0x11, 0x22)),
+            Payload::Sges(&one),
+        );
+    }
+
+    /// The same guard lets an addressed SEND through, and the address lands in `ud` intact.
+    #[test]
+    fn addressed_send_stages_its_address_in_ud() {
+        let mut buf = LegacyBatch::with_capacity(1, 1, 0);
+        let one = [sge(0x30, 8, 3)];
+        let ah = 0x5000usize as *mut ffi::ibv_ah;
+        buf.push(
+            1,
+            0,
+            Op::Send { imm: Some(5) },
+            Some((ah, 0x11, 0x22)),
+            Payload::Sges(&one),
+        );
+        let wrs = walk(&mut buf);
+        let wr = unsafe { &*wrs[0] };
+        assert_eq!(wr.opcode, ffi::ibv_wr_opcode::IBV_WR_SEND_WITH_IMM);
+        assert_eq!(unsafe { wr.wr.ud.ah }, ah);
+        assert_eq!(unsafe { wr.wr.ud.remote_qpn }, 0x11);
+        assert_eq!(unsafe { wr.wr.ud.remote_qkey }, 0x22);
+        assert_eq!(unsafe { wr.__bindgen_anon_1.imm_data }, 5u32.to_be());
     }
 }
 

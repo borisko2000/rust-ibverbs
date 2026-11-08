@@ -546,6 +546,25 @@ pub unsafe fn ibv_req_notify_cq(
     unsafe { (*(*cq).context).ops.req_notify_cq.unwrap()(cq, solicited_only) }
 }
 
+/// Post a linked list of send work requests to a queue pair's send queue (`ibv_post_send`).
+///
+/// Returns 0 on success, or the `errno` value on failure, with `bad_wr` set to the first request
+/// that was not posted (the ones ahead of it were). Providers that negate their errnos (ionic)
+/// return the negative value as is.
+///
+/// # Safety
+///
+/// `qp` must be a valid queue pair, `wr` a valid list of send work requests whose buffers stay
+/// valid until they complete, and `bad_wr` valid for writes.
+#[inline]
+pub unsafe fn ibv_post_send(
+    qp: *mut ibv_qp,
+    wr: *mut ibv_send_wr,
+    bad_wr: *mut *mut ibv_send_wr,
+) -> ::std::os::raw::c_int {
+    unsafe { (*(*qp).context).ops.post_send.unwrap()(qp, wr, bad_wr) }
+}
+
 /// Post a linked list of receive work requests to a queue pair's receive queue (`ibv_post_recv`).
 ///
 /// Returns 0 on success, or the `errno` value on failure, with `bad_wr` set to the first request

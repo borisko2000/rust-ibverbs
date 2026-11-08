@@ -195,6 +195,21 @@ pub enum Error {
     #[error("failed to post a send work request")]
     PostSend(#[source] io::Error),
 
+    /// Posting a batch of send work requests through the legacy interface (`ibv_post_send`, see
+    /// [`Fallback`](crate::Fallback)) failed at one of its requests; the ones ahead of it were
+    /// posted. The extended interface posts a batch whole or not at all, and reports its failures
+    /// as [`PostSend`](Self::PostSend).
+    #[error("failed to post a send work request after posting {posted} of the batch")]
+    PostSendBatch {
+        /// How many requests at the front of the batch were posted before the one that failed:
+        /// they are on the queue like any other posted send, so their buffers are in use and their
+        /// signaled completions will arrive.
+        posted: u32,
+        /// The underlying error.
+        #[source]
+        source: io::Error,
+    },
+
     /// Posting a batch of receive work requests failed (`ibv_post_recv` / `ibv_post_srq_recv`)
     /// at one of its requests; the ones ahead of it were posted.
     #[error("failed to post a receive work request after posting {posted} of the batch")]
@@ -315,6 +330,7 @@ impl Error {
             Error::ModifySharedReceiveQueue(_) => &"ibv_modify_srq",
             Error::QuerySharedReceiveQueue(_) => &"ibv_query_srq",
             Error::PostSend(_) => &"ibv_wr_complete",
+            Error::PostSendBatch { .. } => &"ibv_post_send",
             Error::PostReceive { .. } => &"ibv_post_recv",
             Error::PollCompletionQueue(_) => &"completion-queue polling",
             Error::AsyncEvent(_) => &"ibv_get_async_event",

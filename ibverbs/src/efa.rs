@@ -11,7 +11,7 @@
 use crate::error::{Error, Result, nonnull};
 use crate::mr::{LocalMemorySlice, RemoteMemorySlice};
 use crate::qp::{
-    Datagram, Payload, PreparedQueuePair, QueuePairBuilder, SendOp, Transport, sealed,
+    Datagram, Op, Payload, PreparedQueuePair, QueuePairBuilder, SendOp, Transport, sealed,
 };
 
 #[cfg(doc)]
@@ -68,7 +68,9 @@ impl QueuePairBuilder<Srd> {
     ///  - [`Unsupported`](Error::Unsupported): the provider declined the requested send
     ///    operations (`EOPNOTSUPP`; RDMA READ or WRITE on a device without them), or created the
     ///    queue pair without the extended work-request interface this crate posts through
-    ///    (`ibv_qp_to_qp_ex` returned no handle).
+    ///    (`ibv_qp_to_qp_ex` returned no handle), or the builder asked for the legacy
+    ///    `ibv_post_send` path ([`Fallback`](crate::Fallback)), which an SRD queue pair cannot
+    ///    take.
     pub fn build(&self) -> Result<PreparedQueuePair<Srd>> {
         self.check_same_context()?;
         let mut attr = ffi::ibv_qp_init_attr_ex {
@@ -113,8 +115,7 @@ impl SendOp<'_, '_, Srd> {
     #[inline]
     pub fn write(self, wr_id: u64, local: &[LocalMemorySlice], remote: RemoteMemorySlice) {
         let imm = self.imm;
-        let op = SendOp::<Srd>::write_op(imm, remote);
-        self.build(wr_id, Payload::Sges(local), op)
+        self.build(wr_id, Payload::Sges(local), Op::Write { imm, remote })
     }
 
     /// Post an RDMA READ from `remote` into `local`.
@@ -125,7 +126,6 @@ impl SendOp<'_, '_, Srd> {
     /// ([`QueuePairBuilder::set_max_send_sge`]).
     #[inline]
     pub fn read(self, wr_id: u64, local: &[LocalMemorySlice], remote: RemoteMemorySlice) {
-        let op = SendOp::<Srd>::read_op(remote);
-        self.build(wr_id, Payload::Sges(local), op)
+        self.build(wr_id, Payload::Sges(local), Op::Read { remote })
     }
 }

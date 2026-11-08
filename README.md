@@ -162,11 +162,20 @@ The minimum supported Rust version is 1.85.
 
 ### Provider requirements
 
-The crate drives completion queues and queue pairs exclusively through the extended verbs
-(`ibv_create_cq_ex`, `ibv_create_qp_ex`, and the `ibv_wr_*` send API). Providers that implement
-them include `mlx5`, `hns`, `efa`, and `rxe`; on providers that do not (for example
-`mlx4`-generation hardware), creation fails cleanly (with `Error::Unsupported`) rather than
-degrading to the legacy verbs.
+The crate drives completion queues through the extended verbs (`ibv_create_cq_ex`) and, by
+default, queue pairs too (`ibv_create_qp_ex` and the `ibv_wr_*` send API). Providers that
+implement them include `mlx5`, `hns`, `efa`, and `rxe`; on providers that do not (for example
+`mlx4`-generation hardware, or `irdma`, which has no `ibv_create_qp_ex`), queue-pair creation
+fails cleanly with `Error::Unsupported` rather than silently degrading.
+
+A caller that wants to run on such a provider opts in with
+`QueuePairBuilder::set_fallback(Fallback::LegacyPostSend)`: the queue pair is then created with
+`ibv_create_qp` and its batches are posted with `ibv_post_send`, through the same `SendBatch` /
+`SendOp` API. `QueuePair::is_legacy` reports which path a queue pair took. The legacy path copies
+scatter/gather lists and inline bytes once per request, posts a failed batch up to the request
+that failed (`Error::PostSendBatch` counts the ones posted) rather than not at all, and cannot
+post `FLUSH` or `ATOMIC_WRITE`. The completion-queue side still requires `ibv_create_cq_ex`,
+which `irdma` does provide.
 
 ## Documentation
 
